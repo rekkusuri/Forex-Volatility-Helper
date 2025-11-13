@@ -107,15 +107,15 @@ def build_weekly_dataset(
     if "volume" in hourly.columns:
         agg_map["volume"] = "sum"
 
-    weekly = hourly.resample("W-MON", label="left", closed="left").agg(agg_map)
+    weekly = hourly.resample("W-SUN", label="left", closed="left").agg(agg_map)
     weekly.columns = ["_".join(filter(None, col)).strip("_") for col in weekly.columns]
     pip_size = hourly.attrs.get("pip_size", 1.0)
 
-    high_max = hourly["high"].resample("W-MON", label="left", closed="left").max()
-    low_min = hourly["low"].resample("W-MON", label="left", closed="left").min()
+    high_max = hourly["high"].resample("W-SUN", label="left", closed="left").max()
+    low_min = hourly["low"].resample("W-SUN", label="left", closed="left").min()
     weekly["week_range_pips"] = (high_max - low_min) / pip_size
 
-    hours_in_week = hourly["close"].resample("W-MON", label="left", closed="left").count()
+    hours_in_week = hourly["close"].resample("W-SUN", label="left", closed="left").count()
     weekly["hours_in_week"] = hours_in_week
     weekly = weekly[weekly["hours_in_week"] >= min_hours_per_week]
 

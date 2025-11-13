@@ -63,6 +63,24 @@ def parse_args() -> argparse.Namespace:
         help="Quantile levels to fit when --model-type=quantile.",
     )
     parser.add_argument(
+        "--tree-learning-rate",
+        type=float,
+        default=0.05,
+        help="Learning rate for the tree regressor (default: 0.05).",
+    )
+    parser.add_argument(
+        "--tree-max-depth",
+        type=int,
+        default=6,
+        help="Maximum depth for each tree in the regressor (default: 6).",
+    )
+    parser.add_argument(
+        "--tree-max-iter",
+        type=int,
+        default=400,
+        help="Number of boosting iterations for the tree regressor (default: 400).",
+    )
+    parser.add_argument(
         "--model-output",
         type=Path,
         default=Path("models"),
@@ -95,7 +113,13 @@ def main() -> None:
     feature_columns = list(features.columns)
 
     if args.model_type == "tree":
-        estimator = train_tree_model(X_train, y_train)
+        estimator = train_tree_model(
+            X_train,
+            y_train,
+            learning_rate=args.tree_learning_rate,
+            max_depth=args.tree_max_depth,
+            max_iter=args.tree_max_iter,
+        )
         metrics = evaluate_tree_model(estimator, X_train, y_train, X_test, y_test)
         artifact = VolatilityModel(
             model_type="tree",

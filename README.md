@@ -40,7 +40,9 @@ exceeds user-defined pip thresholds.
    ```
 
    Use `--model-type quantile --quantiles 0.1 0.5 0.9` for probabilistic intervals,
-   or `./models/train_garch.py --dataset ...` to fit a GARCH volatility model.
+   or `./models/train_garch.py --dataset ...` to fit a GARCH volatility model. For the
+   tree regressor you can tune `--tree-learning-rate`, `--tree-max-depth`, and
+   `--tree-max-iter` (e.g., `--tree-learning-rate 0.03 --tree-max-depth 3 --tree-max-iter 800`).
 
 5. **Generate a forecast and exceedance probabilities**
    ```bash
