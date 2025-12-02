@@ -1,0 +1,154 @@
+Here’s a practical playbook to work through all the improvements we talked about while staying in the OHLC-only world.
+
+1. Limit the history (recent years only) + walk-forward checks
+
+Slice the merged hourly history to the last N years before feature engineering. Quick helper:
+
+python - <<'PY'
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent  # or hardcode the repo path
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+import pandas as pd
+from forex_helper.data import get_hourly_history
+
+pair = "EURUSD=X"
+hourly, _ = get_hourly_history(pair, preload_dir="data/preload", raw_dir="data/raw")
+cutoff = hourly.index.max() - pd.Timedelta(days=365*4)
+hourly.loc[hourly.index >= cutoff].to_csv("data/raw/EURUSD_X_recent.csv")
+print("saved", len(hourly.loc[hourly.index >= cutoff]), "rows")
+PY
+
+Build features from that trimmed CSV:
+
+./data/make_dataset.py \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --weekly-lags 1 2 3 4 5 6 7 8 \
+    --input data/raw/EURUSD_X_recent.csv
+
+./data/make_dataset.py \
+    --input data/raw/EURUSD_X_1h.csv \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --min-hours 96 \
+    --preload-dir data/preload
+
+Merge the latest data with preload_recent
+./data/make_dataset.py \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --weekly-lags 1 2 3 4 5 6 7 8 \
+    --input data/raw/EURUSD_X_recent.csv \
+    --preload-dir data/empty \
+    --raw-dir data/raw
+
+For walk-forward validation, use sklearn.model_selection.TimeSeriesSplit inside a small notebook/script to iteratively train on weeks 1..k and validate on week k+1. That shows whether performance stabilises when limiting to recent data.
+
+2. Target transformations + richer lag/rolling features
+
+Lag depth: Already using --weekly-lags above (extend to 10–12 weeks if helpful).
+Rolling stats: Modify build_weekly_dataset to add, e.g., weekly["range_ma_4"] = weekly["week_range_pips"].rolling(4).mean() and .rolling(...).std(). These still rely only on OHLC-derived weekly ranges.
+Alternate targets:
+Log-range: set weekly["future_range_pips"] = np.log1p(weekly["week_range_pips"].shift(-1)), then remember to np.expm1 predictions in predict.py.
+ATR-style: replace the target with the forward sum of true_range_pips (already computed) instead of high–low range.
+Each variation requires retraining, so branch the code (e.g., target_mode flag) to compare.
+
+3. Model tuning / options
+
+Tree regressor (train_model.py --model-type tree):
+
+Edit train_tree_model to accept CLI overrides, e.g., add args --max-depth, --learning-rate, --max-iter.
+Try max_depth=3, learning_rate=0.03, max_iter=800 for smoother fits.
+
+./models/train_model.py \       
+    --dataset data/processed/EURUSD_X_h1.csv \
+    --pair EURUSD=X \
+    --horizon 1 \                                                          
+    --model-type tree \                      
+    --tree-learning-rate 0.03 \
+    --tree-max-depth 3 \
+    --tree-max-iter 800  
+
+Quantile version:
+
+Use --model-type quantile --quantiles 0.1 0.5 0.9. Median forecasts sometimes outperform the mean on skewed targets.
+Track pinball losses in the metrics JSON to see if the intervals are calibrated.
+
+./models/train_model.py \
+    --dataset data/processed/EURUSD_X_h1.csv \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --model-type quantile \
+    --quantiles 0.1 0.5 0.9
+
+GARCH:
+
+After trimming the dataset, run:
+
+./models/train_garch.py \
+    --dataset data/processed/EURUSD_X_h1.csv \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --order 1 2 \
+    --dist t \
+    --test-size 0.15
+Compare RMSE/MAE and interval coverage with the tree model. Smaller windows often help GARCH.
+
+Baseline: compute a simple benchmark like “next week’s range ≈ last week’s range”:
+
+python - <<'PY'
+import pandas as pd
+df = pd.read_csv("data/processed/EURUSD_X_h1.csv", index_col=0, parse_dates=True)
+y = df["target_future_range_pips"]
+baseline = df["week_range_pips"].shift(1).loc[y.index]
+mae = (y - baseline).abs().mean()
+print("baseline MAE:", mae)
+PY
+Use this to judge whether your models actually add value.
+
+4. Putting it all together
+
+A full refresh cycle might look like:
+
+Trim history and build dataset with extended lags:
+
+./data/make_dataset.py \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --weekly-lags 1 2 3 4 5 6 7 8 9 10 \
+    --input data/raw/EURUSD_X_recent.csv
+Train a tuned tree + quantile model:
+
+./models/train_model.py \
+    --dataset data/processed/EURUSD_X_h1.csv \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --model-type tree
+
+./models/train_model.py \
+    --dataset data/processed/EURUSD_X_h1.csv \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --model-type quantile \
+    --quantiles 0.1 0.5 0.9
+Train a GARCH model on the same trimmed dataset:
+
+./models/train_garch.py \
+    --dataset data/processed/EURUSD_X_h1.csv \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --order 1 2 \
+    --dist t
+Run the baseline script to sanity-check improvement.
+
+Use predict.py with the selected artifact (don’t forget --weekly-lags to match training):
+
+./predict.py \
+    --pair EURUSD=X \
+    --model models/EURUSD_X_h1.joblib \
+    --horizon 1 \
+    --weekly-lags 1 2 3 4 5 6 7 8 9 10
+If metrics still lag the baseline, switch the target to log-range or ATR (step 2) and repeat. This process keeps everything OHLC-derived but gives the model more memory, better-calibrated targets, and fair validation.

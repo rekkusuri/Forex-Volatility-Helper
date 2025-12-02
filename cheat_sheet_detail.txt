@@ -1,0 +1,261 @@
+Here’s a fully fleshed-out README that covers every scenario we’ve discussed—preload-only runs, mixing in fresh Yahoo downloads, trimming to recent history, tuning models, training quantile/GARCH variants, and generating predictions. Use it as the single reference point for every workflow.
+
+Forex-Volatility-Helper
+Predict the next-week (or multi-week) pip range for a forex pair using hourly OHLC data. The toolkit:
+
+Loads historical candles from Tick Data Suite exports (GMT+0) and optionally merges recent Yahoo Finance downloads.
+Builds weekly volatility features with configurable lag depth and horizon.
+Trains one of three model families (tree, quantile, or GARCH) and saves artifacts plus metrics.
+Generates forecasts and exceedance probabilities for user-defined pip thresholds.
+Installation
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+Dependencies: pandas, numpy, scikit-learn, joblib, scipy, arch, yfinance (only for downloads).
+
+Data Sources
+Preload history (data/preload/): Tick Data Suite H1 exports named like EURUSD_GMT+0_NO-DST_H1.csv. These are treated as ground truth and automatically normalised into data/preload/processed/PAIR_H1_preprocessed.csv on first use. Timestamps are assumed GMT+0 (UTC).
+Raw downloads (data/raw/): Yahoo Finance hourly CSVs (e.g., EURUSD_X_1h.csv) for recent updates. You can place multiple files in this folder; the system deduplicates overlapping timestamps.
+Trimmed recent slice (data/raw/EURUSD_X_recent.csv): If you want to limit the training window (e.g., last 4 years), run the helper snippet below to create a filtered CSV.
+The loader (get_hourly_history) merges all available sources (preload processed + raw files + optional --input CSV), de-duplicates by timestamp, converts everything to UTC, and returns a clean open/high/low/close/volume DataFrame. If you point --preload-dir or --raw-dir to an empty directory, those parts of the pipeline are effectively disabled.
+
+Workflows
+1. Download fresh Yahoo data
+./data/download_data.py --pair EURUSD=X --start 2025-01-01 --output data/raw
+This fetches the latest hourly candles that Yahoo Finance still serves (~last 730 days) and drops them in data/raw/EURUSD_X_1h.csv. If you don’t need Yahoo (preload already covers the period), skip this step.
+
+2. (Optional) Trim to recent history
+To focus on the last N years, merge preload + raw into an hourly frame, then filter:
+
+python - <<'PY'
+import sys
+from pathlib import Path
+import pandas as pd
+from forex_helper.data import get_hourly_history
+
+PROJECT_ROOT = Path(__file__).resolve().parent  # run from repo root
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+pair = "EURUSD=X"
+hourly, _ = get_hourly_history(pair, preload_dir="data/preload", raw_dir="data/raw")
+cutoff = hourly.index.max() - pd.Timedelta(days=365*4)  # last 4 years
+recent = hourly.loc[hourly.index >= cutoff]
+recent.to_csv("data/raw/EURUSD_X_recent.csv")
+print(f"Saved {len(recent):,} rows to data/raw/EURUSD_X_recent.csv")
+PY
+You can then build a dataset from that CSV while optionally merging any newer raw files by tweaking --preload-dir/--raw-dir (see the next step).
+
+./scripts/trim_recent.py \
+    --pair EURUSD=X \
+    --years 4 \
+    --output data/raw/EURUSD_X_recent.csv
+
+3. Build the weekly dataset
+Default (preload + raw)
+
+./data/make_dataset.py \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --weekly-lags 1 2 3 4 \
+    --min-hours 96
+--pair: Forex symbol; used to infer pip size and to locate matching preload/raw files.
+--horizon: Target horizon in weeks (1 = next week, 2 = sum of next two weeks, etc.).
+--weekly-lags: Lagged weeks to include as features. Provide as many as you like (e.g., 1 2 3 4 5 6 7 8). More lags = more weeks dropped at the start to satisfy the window.
+--min-hours: Minimum hourly observations required to keep a week (default 96 = 4 trading days).
+--preload-dir: Defaults to data/preload. Point to data/empty if you want to ignore preloads.
+--raw-dir: Defaults to data/raw. Point to data/empty to ignore raw downloads and use only --input.
+Preload-only (no Yahoo)
+
+mkdir -p data/empty
+./data/make_dataset.py \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --weekly-lags 1 2 3 4 \
+    --preload-dir data/preload \
+    --raw-dir data/empty
+Recent slice + latest raw
+
+./data/make_dataset.py \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --weekly-lags 1 2 3 4 5 6 7 8 \
+    --input data/raw/EURUSD_X_recent.csv \
+    --preload-dir data/empty \
+    --raw-dir data/raw
+Outputs: data/processed/EURUSD_X_h{horizon}.csv containing weekly features + target_future_range_pips.
+
+4. Train models
+Tree (mean forecast)
+./models/train_model.py \
+    --dataset data/processed/EURUSD_X_h1.csv \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --model-type tree \
+    --tree-learning-rate 0.03 \
+    --tree-max-depth 3 \
+    --tree-max-iter 800
+Tunable flags (defaults in parentheses):
+
+--tree-learning-rate (0.05)
+--tree-max-depth (6)
+--tree-max-iter (400)
+The script saves a .joblib artifact under models/ and a metrics JSON under models/metrics/.
+
+Quantile (probabilistic intervals)
+./models/train_model.py \
+    --dataset data/processed/EURUSD_X_h1.csv \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --model-type quantile \
+    --quantiles 0.1 0.5 0.9
+The median quantile serves as the point forecast; other quantiles provide interval bounds. The JSON metrics include pinball loss and interval coverage details.
+
+GARCH
+./models/train_garch.py \
+    --dataset data/processed/EURUSD_X_h1.csv \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --order 1 2 \
+    --dist t \
+    --test-size 0.2
+Parameters:
+
+--order P Q: GARCH(p, q) order (default 1 1).
+--dist: innovation distribution (normal, t, skewt, ged).
+--test-size: fraction of weekly returns reserved for evaluation (default 0.2).
+Produces a .joblib GARCH artifact (e.g., models/EURUSD_X_h1_garch.joblib) plus metrics.
+
+5. Forecast / Exceedance probabilities
+./predict.py \
+    --pair EURUSD=X \
+    --model models/EURUSD_X_h1.joblib \
+    --horizon 1 \
+    --thresholds 350 400 500 \
+    --min-hours 96 \
+    --weekly-lags 1 2 3 4
+Key flags:
+
+--pair: same as training.
+--model: path to the trained .joblib artifact (tree/quantile/garch).
+--weekly-lags: must match the lag configuration used when creating the dataset.
+--preload-dir, --raw-dir, --raw-csv: optional; default behaviour merges the processed preload with whatever’s under data/raw/.
+For GARCH artifacts, you can omit --weekly-lags; the script automatically computes the latest close and prints the expected absolute move plus P(|return| > threshold).
+
+Advanced Topics
+Limiting History / Walk-Forward Validation
+To focus on the last X years, generate data/raw/PAIR_recent.csv (as shown above), then run make_dataset.py with --preload-dir data/empty and --input data/raw/PAIR_recent.csv.
+For walk-forward validation, load data/processed/PAIR_h1.csv in a notebook and use sklearn.model_selection.TimeSeriesSplit to iteratively train/test.
+Alternate Targets (still OHLC-derived)
+Modify build_weekly_dataset to set weekly["future_range_pips"] to np.log1p(weekly["week_range_pips"].shift(-1)) for a log-range target, or use the sum of future true ranges for an ATR-style target.
+Remember to invert the transform in predict.py (np.expm1 for log).
+Rolling Statistics
+Inside build_weekly_dataset, after computing weekly["week_range_pips"], add:
+
+weekly["range_ma_4"] = weekly["week_range_pips"].rolling(4).mean()
+weekly["range_std_4"] = weekly["week_range_pips"].rolling(4).std()
+(or any other window sizes). These features remain OHLC-only.
+
+ISO Week Definition
+By default, weeks start Monday 00:00 UTC (“W-MON”). If you prefer weeks that start Sunday, change the resample frequency to "W-SUN" in build_weekly_dataset.
+Troubleshooting
+ModuleNotFoundError: No module named 'forex_helper': When running ad-hoc Python scripts, add sys.path.insert(0, 'src') or run them through the CLI wrappers.
+“Permission denied” on ./*.py: chmod +x the script before executing.
+Metrics look poor: Trim history to recent years, increase --weekly-lags, tune tree hyperparameters, or switch to quantile/GARCH models. Compare against a simple baseline to quantify improvement.
+Latest week missing: The pipeline only uses complete weeks and drops the final week needed for the target horizon. Add more hourly data (through the following week) to include it.
+Need multiple weeks’ prediction bounds: Use quantile models (--model-type quantile) and print quantile forecasts. For tree models, confidence is approximated by residual std; for quantile models it comes from the quantiles themselves; for GARCH use probability_exceed_from_close.
+Example End-to-End Script (4-year window, tuned tree)
+# 1. Merge data and trim last 4 years
+./scripts/trim_recent.py \
+    --pair EURUSD=X \
+    --years 4 \
+    --output data/raw/EURUSD_X_recent.csv
+
+# 2. Build dataset with 8 lags, no preloads, combine recent CSV + current Yahoo download
+./data/make_dataset.py \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --weekly-lags 1 2 3 4 5 6 7 8 \
+    --input data/raw/EURUSD_X_recent.csv \
+    --preload-dir data/empty \
+    --raw-dir data/raw
+
+# 3. Train tuned tree and quantile models
+./models/train_model.py \
+    --dataset data/processed/EURUSD_X_h1.csv \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --model-type tree \
+    --tree-learning-rate 0.03 \
+    --tree-max-depth 3 \
+    --tree-max-iter 800
+
+./models/train_model.py \
+    --dataset data/processed/EURUSD_X_h1.csv \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --model-type quantile \
+    --quantiles 0.1 0.5 0.9
+
+# 4. Train GARCH as a comparison
+./models/train_garch.py \
+    --dataset data/processed/EURUSD_X_h1.csv \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --order 1 2 --dist t
+
+# 5. Forecast with the preferred artifact
+./predict.py \
+    --pair EURUSD=X \
+    --model models/EURUSD_X_h1.joblib \
+    --horizon 1 \
+    --thresholds 300 400 500 \
+    --min-hours 96 \
+    --weekly-lags 1 2 3 4 5 6 7 8
+This README now captures every “what if” we covered: deep preload-only runs, adding Yahoo data, trimming to recent windows, increasing lag depth, tuning tree hyperparameters, training quantile/GARCH models, adjusting week definitions, and interpreting missing weeks. Let me know if you’d like a PDF version or a “quick start” script that chains everything together automatically.
+
+
+
+# 1. Merge data and trim last 4 years
+python scripts/trim_recent.py --pair EURUSD=X --years 4 --output data/raw/EURUSD_X_recent.csv
+
+# 2. Build dataset with 8 lags, no preloads, combine recent CSV + current Yahoo download
+./data/make_dataset.py \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --weekly-lags 1 2 3 4 5 6 7 8 \
+    --input data/raw/EURUSD_X_recent.csv \
+    --preload-dir data/empty \
+    --raw-dir data/raw
+
+# 3. Train tuned tree and quantile models
+./models/train_model.py \
+    --dataset data/processed/EURUSD_X_h1.csv \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --model-type tree \
+    --tree-learning-rate 0.03 \
+    --tree-max-depth 3 \
+    --tree-max-iter 800
+
+./models/train_model.py \
+    --dataset data/processed/EURUSD_X_h1.csv \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --model-type quantile \
+    --quantiles 0.1 0.5 0.9
+
+# 4. Train GARCH as a comparison
+./models/train_garch.py \
+    --dataset data/processed/EURUSD_X_h1.csv \
+    --pair EURUSD=X \
+    --horizon 1 \
+    --order 1 2 --dist t
+
+# 5. Forecast with the preferred artifact
+./predict.py \
+    --pair EURUSD=X \
+    --model models/EURUSD_X_h1.joblib \
+    --horizon 1 \
+    --thresholds 300 400 500 \
+    --min-hours 96 \
+    --weekly-lags 1 2 3 4 5 6 7 8
